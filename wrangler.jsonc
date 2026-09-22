@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "bunnydl-bilibili-rest-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-22",
+  "kv_namespaces": [
+    {
+      "binding": "SESSIONS",
+      "id": "957202def4544db7abf7bff159b98c88"
+    }
+  ]
+}
