@@ -1,6 +1,8 @@
-const BUNNY_BASE = "https://dlbunny.com";
+const BUNNY = "https://dlbunny.com";
 
-const CORS = {
+const SESSION_TTL = 10 * 60; // 10 menit
+
+const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
@@ -11,858 +13,1266 @@ function json(data, status = 200) {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      ...CORS,
+      ...CORS_HEADERS,
     },
   });
 }
 
-function html(content, status = 200) {
-  return new Response(content, {
-    status,
+function html(body) {
+  return new Response(body, {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-store",
+      ...CORS_HEADERS,
     },
   });
 }
 
-function normalizeVideo(item, index) {
-  if (!item || typeof item !== "object") return null;
+function randomId(length = 32) {
+  const chars =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-  const width = Number(item.width) || null;
-  const height = Number(item.height) || null;
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
 
-  return {
-    index,
+  let result = "";
 
-    url:
-      item.url ??
-      item.video_url ??
-      item.play_addr ??
-      item.download_url ??
-      null,
+  for (const byte of bytes) {
+    result += chars[byte % chars.length];
+  }
 
-    width,
-    height,
-
-    resolution:
-      item.resolution ??
-      (width && height ? `${width}x${height}` : null),
-
-    format:
-      item.ext ??
-      item.format ??
-      item.media_format ??
-      "mp4",
-
-    size:
-      item.size ??
-      item.file_size ??
-      item.filesize ??
-      null,
-
-    attr: item.attr ?? null,
-    donate_flag: item.donate_flag ?? null,
-
-    raw: item,
-  };
+  return result;
 }
 
-function extractVideos(data) {
-  const candidates = [
-    data?.video_play_addr,
-    data?.data?.video_play_addr,
-    data?.result?.video_play_addr,
-    data?.info?.video_play_addr,
+/*
+ * Ambil semua Set-Cookie dari response upstream.
+ * Workers mendukung Headers.getSetCookie().
+ */
+function getSetCookies(headers) {
+  try {
+    if (typeof headers.getSetCookie === "function") {
+      return headers.getSetCookie();
+    }
+  } catch (_) {}
+
+  const single = headers.get("set-cookie");
+
+  if (!single) return [];
+
+  return [single];
+}
+
+/*
+ * Ubah Set-Cookie menjadi Cookie header.
+ */
+function mergeCookies(existing, setCookies) {
+  const jar = new Map();
+
+  function addCookieString(cookieString) {
+    if (!cookieString) return;
+
+    const parts = cookieString.split(";");
+
+    for (const part of parts) {
+      const item = part.trim();
+
+      if (!item) continue;
+
+      const equal = item.indexOf("=");
+
+      if (equal === -1) continue;
+
+      const name = item.slice(0, equal).trim();
+      const value = item.slice(equal + 1).trim();
+
+      if (!name) continue;
+
+      jar.set(name, value);
+      break;
+    }
+  }
+
+  if (existing) {
+    for (const item of existing.split(";")) {
+      addCookieString(item);
+    }
+  }
+
+  for (const cookie of setCookies) {
+    addCookieString(cookie);
+  }
+
+  return [...jar.entries()]
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ");
+}
+
+function extractCaptchaUUID(htmlText) {
+  /*
+   * Target:
+   * <img id="VerifyCaptchaIMG" uuid="XXXXXXXX" ...>
+   */
+
+  const patterns = [
+    /id=["']VerifyCaptchaIMG["'][^>]*uuid=["']([^"']+)["']/i,
+    /uuid=["']([^"']+)["'][^>]*id=["']VerifyCaptchaIMG["']/i,
   ];
 
-  for (const candidate of candidates) {
-    if (Array.isArray(candidate)) {
-      return candidate
-        .map((item, index) => normalizeVideo(item, index))
-        .filter(Boolean);
-    }
+  for (const regex of patterns) {
+    const match = htmlText.match(regex);
 
-    if (candidate && typeof candidate === "object") {
-      return Object.values(candidate)
-        .map((item, index) => normalizeVideo(item, index))
-        .filter(Boolean);
+    if (match?.[1]) {
+      return match[1];
     }
   }
 
-  return [];
+  return null;
 }
 
-async function resolve(request) {
-  let body;
+async function saveSession(env, sessionId, session) {
+  await env.SESSIONS.put(
+    `session:${sessionId}`,
+    JSON.stringify(session),
+    {
+      expirationTtl: SESSION_TTL,
+    }
+  );
+}
+
+async function getSession(env, sessionId) {
+  if (!sessionId) return null;
+
+  const raw = await env.SESSIONS.get(`session:${sessionId}`);
+
+  if (!raw) return null;
 
   try {
-    body = await request.json();
-  } catch {
-    return json(
-      {
-        success: false,
-        error: "Body harus berupa JSON.",
-      },
-      400
-    );
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function deleteSession(env, sessionId) {
+  if (!sessionId) return;
+
+  await env.SESSIONS.delete(`session:${sessionId}`);
+}
+
+/*
+ * Bu request hanya mengambil halaman BunnyDL
+ * untuk mendapatkan cookie/session normal.
+ */
+async function createSession(env) {
+  const sessionId = randomId(40);
+
+  const response = await fetch(`${BUNNY}/id/bilibili`, {
+    method: "GET",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/149 Mobile Safari/537.36",
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`BunnyDL page HTTP ${response.status}`);
   }
 
-  const {
-    url,
-    captcha_uuid,
-    captcha_code,
-    anonymous = true,
-    format = "mp4",
-  } = body;
+  const page = await response.text();
 
-  if (!url) {
-    return json(
-      {
-        success: false,
-        error: "URL BiliBili wajib diisi.",
-      },
-      400
-    );
-  }
+  const setCookies = getSetCookies(response.headers);
 
-  if (!captcha_uuid) {
-    return json(
-      {
-        success: false,
-        error: "captcha_uuid wajib diisi.",
-      },
-      400
-    );
-  }
+  let cookie = mergeCookies("", setCookies);
 
-  if (!captcha_code) {
-    return json(
-      {
-        success: false,
-        error: "captcha_code wajib diisi.",
-      },
-      400
-    );
-  }
+  const captchaUUID = extractCaptchaUUID(page);
 
-  const payload = {
-    user_uuid_text: String(captcha_uuid),
-    user_input_text: String(url),
-    user_select_media_format: String(format),
-    user_select_appid: 3,
-    user_select_app: "bilibili",
-    user_input_captcha_text: String(captcha_code),
-    user_anonymous: Boolean(anonymous),
+  /*
+   * Kalau halaman tidak memberi UUID langsung,
+   * tetap simpan session dan biarkan endpoint captcha
+   * bekerja menggunakan cookie yang sama.
+   */
+  const session = {
+    cookie,
+    captchaUUID,
+    createdAt: Date.now(),
   };
 
-  let upstream;
+  await saveSession(env, sessionId, session);
 
+  return {
+    sessionId,
+    captchaUUID,
+  };
+}
+
+/*
+ * GET /api/session
+ */
+async function handleCreateSession(env) {
   try {
-    upstream = await fetch(`${BUNNY_BASE}/api/create_oxy_order`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0",
-        Origin: BUNNY_BASE,
-        Referer: `${BUNNY_BASE}/id/bilibili`,
-      },
-      body: JSON.stringify(payload),
+    const result = await createSession(env);
+
+    return json({
+      status: 200,
+      success: true,
+      message: "Session berhasil dibuat",
+      session_id: result.sessionId,
+      captcha_uuid: result.captchaUUID,
+      expires_in: SESSION_TTL,
     });
   } catch (error) {
     return json(
       {
+        status: 500,
         success: false,
-        error: "Gagal menghubungi BunnyDL.",
-        detail: String(error?.message || error),
+        message: "Gagal membuat session",
+        error: error.message,
       },
-      502
+      500
     );
   }
+}
 
-  const contentType = upstream.headers.get("content-type") || "";
+/*
+ * GET /api/captcha?session_id=xxx
+ */
+async function handleCaptcha(request, env) {
+  const url = new URL(request.url);
 
-  let data;
+  const sessionId = url.searchParams.get("session_id");
 
-  try {
-    if (contentType.includes("application/json")) {
-      data = await upstream.json();
-    } else {
-      const text = await upstream.text();
-
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = {
-          raw_response: text,
-        };
-      }
-    }
-  } catch {
+  if (!sessionId) {
     return json(
       {
+        status: 400,
         success: false,
-        error: "Response BunnyDL tidak dapat dibaca.",
-        upstream_status: upstream.status,
+        message: "session_id wajib diisi",
       },
-      502
+      400
     );
   }
 
-  const videos = extractVideos(data);
+  const session = await getSession(env, sessionId);
 
-  return json({
-    success: upstream.ok,
-    upstream_status: upstream.status,
+  if (!session) {
+    return json(
+      {
+        status: 404,
+        success: false,
+        message: "Session tidak ditemukan atau sudah expired",
+      },
+      404
+    );
+  }
 
-    message:
-      data?.info ??
-      data?.message ??
-      data?.msg ??
-      null,
+  const rand = Math.floor(Math.random() * 1000000);
 
-    videos,
+  const captchaURL =
+    `${BUNNY}/api/get_captcha?rand=${rand}`;
 
-    upstream: data,
+  const response = await fetch(captchaURL, {
+    method: "GET",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/149 Mobile Safari/537.36",
+      "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      "Referer": `${BUNNY}/id/bilibili`,
+      "Cookie": session.cookie || "",
+    },
+  });
+
+  if (!response.ok) {
+    return json(
+      {
+        status: response.status,
+        success: false,
+        message: "Gagal mengambil CAPTCHA dari BunnyDL",
+      },
+      response.status
+    );
+  }
+
+  /*
+   * Kalau endpoint CAPTCHA memberikan cookie baru,
+   * masukkan ke session yang sama.
+   */
+  const newCookies = getSetCookies(response.headers);
+
+  if (newCookies.length) {
+    session.cookie = mergeCookies(
+      session.cookie,
+      newCookies
+    );
+
+    await saveSession(env, sessionId, session);
+  }
+
+  const contentType =
+    response.headers.get("content-type") ||
+    "image/png";
+
+  return new Response(response.body, {
+    status: 200,
+    headers: {
+      "Content-Type": contentType,
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      "Pragma": "no-cache",
+      ...CORS_HEADERS,
+    },
   });
 }
 
+/*
+ * Cari array video_play_addr di response BunnyDL
+ */
+function findVideoPlayAddr(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findVideoPlayAddr(item);
+
+      if (found) return found;
+    }
+
+    return null;
+  }
+
+  if (
+    Array.isArray(value.video_play_addr)
+  ) {
+    return value.video_play_addr;
+  }
+
+  for (const key of Object.keys(value)) {
+    const found = findVideoPlayAddr(value[key]);
+
+    if (found) return found;
+  }
+
+  return null;
+}
+
+/*
+ * Cari auto_stand_url
+ */
+function findAutoStandURL(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findAutoStandURL(item);
+
+      if (found) return found;
+    }
+
+    return null;
+  }
+
+  if (
+    typeof value.auto_stand_url === "string" &&
+    value.auto_stand_url
+  ) {
+    return value.auto_stand_url;
+  }
+
+  for (const key of Object.keys(value)) {
+    const found = findAutoStandURL(value[key]);
+
+    if (found) return found;
+  }
+
+  return null;
+}
+
+/*
+ * POST /api/resolve
+ */
+async function handleResolve(request, env) {
+  let body;
+
+  try {
+    body = await request.json();
+  } catch (_) {
+    return json(
+      {
+        status: 400,
+        success: false,
+        message: "Body harus JSON",
+      },
+      400
+    );
+  }
+
+  const sessionId =
+    typeof body.session_id === "string"
+      ? body.session_id.trim()
+      : "";
+
+  const bilibiliUrl =
+    typeof body.url === "string"
+      ? body.url.trim()
+      : "";
+
+  const captchaCode =
+    typeof body.captcha_code === "string"
+      ? body.captcha_code.trim()
+      : "";
+
+  const format =
+    typeof body.format === "string"
+      ? body.format.trim().toLowerCase()
+      : "mp4";
+
+  if (!sessionId) {
+    return json(
+      {
+        status: 400,
+        success: false,
+        message: "session_id wajib diisi",
+      },
+      400
+    );
+  }
+
+  if (!bilibiliUrl) {
+    return json(
+      {
+        status: 400,
+        success: false,
+        message: "URL BiliBili wajib diisi",
+      },
+      400
+    );
+  }
+
+  if (!captchaCode) {
+    return json(
+      {
+        status: 400,
+        success: false,
+        message: "Kode CAPTCHA wajib diisi",
+      },
+      400
+    );
+  }
+
+  if (!["mp4", "mp3", "jpeg"].includes(format)) {
+    return json(
+      {
+        status: 400,
+        success: false,
+        message: "Format harus mp4, mp3, atau jpeg",
+      },
+      400
+    );
+  }
+
+  const session = await getSession(env, sessionId);
+
+  if (!session) {
+    return json(
+      {
+        status: 404,
+        success: false,
+        message:
+          "Session expired. Buat session baru dan CAPTCHA baru.",
+      },
+      404
+    );
+  }
+
+  /*
+   * Payload mengikuti flow BunnyDL yang sudah kita temukan.
+   */
+  const payload = {
+    user_uuid_text: session.captchaUUID || "",
+    user_input_text: bilibiliUrl,
+    user_select_media_format: format,
+    user_select_appid: 3,
+    user_select_app: "bilibili",
+    user_input_captcha_text: captchaCode,
+    user_anonymous: true,
+  };
+
+  let response;
+
+  try {
+    response = await fetch(
+      `${BUNNY}/api/create_oxy_order`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/plain, */*",
+          "User-Agent":
+            "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/149 Mobile Safari/537.36",
+          "Referer": `${BUNNY}/id/bilibili`,
+          "Origin": BUNNY,
+          "Cookie": session.cookie || "",
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+  } catch (error) {
+    return json(
+      {
+        status: 502,
+        success: false,
+        message: "Gagal menghubungi BunnyDL",
+        error: error.message,
+      },
+      502
+    );
+  }
+
+  const text = await response.text();
+
+  let upstream;
+
+  try {
+    upstream = JSON.parse(text);
+  } catch (_) {
+    upstream = {
+      raw: text,
+    };
+  }
+
+  /*
+   * Update cookie kalau upstream memberikan cookie baru.
+   */
+  const newCookies = getSetCookies(response.headers);
+
+  if (newCookies.length) {
+    session.cookie = mergeCookies(
+      session.cookie,
+      newCookies
+    );
+
+    await saveSession(env, sessionId, session);
+  }
+
+  const videoPlayAddr =
+    findVideoPlayAddr(upstream);
+
+  const autoStandURL =
+    findAutoStandURL(upstream);
+
+  /*
+   * Kalau CAPTCHA salah, BunnyDL biasanya
+   * mengembalikan status 409.
+   */
+  if (
+    upstream &&
+    (
+      upstream.status === 409 ||
+      upstream.code === 409
+    )
+  ) {
+    return json(
+      {
+        status: 409,
+        success: false,
+        message:
+          upstream.info ||
+          upstream.message ||
+          "Kode CAPTCHA salah",
+        upstream,
+      },
+      409
+    );
+  }
+
+  const success =
+    response.ok &&
+    (
+      !!videoPlayAddr ||
+      !!autoStandURL
+    );
+
+  /*
+   * Session hanya dipakai sebentar.
+   * Setelah resolve selesai kita hapus supaya
+   * cookie tidak disimpan lebih lama dari perlu.
+   */
+  await deleteSession(env, sessionId);
+
+  return json({
+    status: upstream?.status ?? response.status,
+    success,
+    message: success
+      ? "Berhasil mendapatkan hasil BunnyDL"
+      : (
+          upstream?.info ||
+          upstream?.message ||
+          "BunnyDL tidak mengembalikan hasil download"
+        ),
+
+    resolution: videoPlayAddr || [],
+
+    download_url:
+      autoStandURL || null,
+
+    upstream,
+  });
+}
+
+/*
+ * Playground
+ */
 function playground() {
-  return html(`<!DOCTYPE html>
+  return html(`
+<!DOCTYPE html>
 <html lang="id">
 <head>
-<meta charset="UTF-8">
-<meta
-  name="viewport"
-  content="width=device-width,initial-scale=1,maximum-scale=1"
-/>
-<title>BunnyDL BiliBili REST API</title>
+  <meta charset="UTF-8">
 
-<style>
-* {
-  box-sizing: border-box;
-}
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  >
 
-html,
-body {
-  margin: 0;
-  padding: 0;
-  background: #f4f5f7;
-  color: #111;
-  font-family:
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
-}
+  <title>BunnyDL BiliBili API</title>
 
-body {
-  min-height: 100vh;
-}
+  <style>
+    * {
+      box-sizing: border-box;
+    }
 
-.app {
-  width: 100%;
-  max-width: 560px;
-  margin: 0 auto;
-  padding: 18px 14px 40px;
-}
+    body {
+      margin: 0;
+      padding: 20px 14px 40px;
+      font-family: Arial, sans-serif;
+      background: #f4f6f8;
+      color: #111;
+    }
 
-.header {
-  margin-bottom: 18px;
-}
+    .container {
+      width: 100%;
+      max-width: 600px;
+      margin: auto;
+    }
 
-.header h1 {
-  margin: 0;
-  font-size: 24px;
-  line-height: 1.2;
-}
+    .card {
+      background: white;
+      border-radius: 18px;
+      padding: 18px;
+      margin-bottom: 14px;
+      box-shadow: 0 8px 30px rgba(0,0,0,.06);
+    }
 
-.header p {
-  margin: 7px 0 0;
-  color: #666;
-  font-size: 13px;
-}
+    h1 {
+      font-size: 23px;
+      margin: 0 0 7px;
+    }
 
-.card {
-  background: #fff;
-  border: 1px solid #ddd;
-  border-radius: 16px;
-  padding: 15px;
-  margin-bottom: 14px;
-  box-shadow: 0 4px 14px rgba(0,0,0,.04);
-}
+    p {
+      color: #666;
+      line-height: 1.5;
+      font-size: 14px;
+    }
 
-label {
-  display: block;
-  font-size: 13px;
-  font-weight: 700;
-  margin-bottom: 7px;
-}
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: bold;
+      margin: 15px 0 7px;
+    }
 
-input,
-select,
-button {
-  width: 100%;
-  min-height: 46px;
-  border-radius: 11px;
-  font-size: 15px;
-}
+    input,
+    select,
+    button {
+      width: 100%;
+      min-height: 46px;
+      border-radius: 12px;
+      border: 1px solid #ddd;
+      padding: 0 13px;
+      font-size: 14px;
+    }
 
-input,
-select {
-  border: 1px solid #ccc;
-  padding: 0 12px;
-  background: #fff;
-  color: #111;
-}
+    input,
+    select {
+      background: white;
+    }
 
-.field {
-  margin-bottom: 14px;
-}
+    button {
+      border: 0;
+      background: #111;
+      color: white;
+      font-weight: bold;
+      margin-top: 14px;
+      cursor: pointer;
+    }
 
-.captcha-box {
-  border: 1px dashed #aaa;
-  border-radius: 12px;
-  padding: 12px;
-  text-align: center;
-  margin-bottom: 12px;
-  background: #fafafa;
-}
+    button:disabled {
+      opacity: .5;
+    }
 
-#captchaImage {
-  display: block;
-  max-width: 100%;
-  min-height: 70px;
-  margin: 0 auto 10px;
-  object-fit: contain;
-}
+    .captcha-box {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
 
-button {
-  border: 0;
-  background: #111;
-  color: #fff;
-  font-weight: 700;
-  cursor: pointer;
-  padding: 0 16px;
-}
+    .captcha-box img {
+      width: 150px;
+      height: 50px;
+      object-fit: contain;
+      background: #eee;
+      border-radius: 8px;
+    }
 
-button.secondary {
-  background: #eee;
-  color: #111;
-  margin-top: 9px;
-}
+    .small-button {
+      width: auto;
+      padding: 0 14px;
+      min-height: 40px;
+      margin: 0;
+      background: #eee;
+      color: #111;
+    }
 
-button:disabled {
-  opacity: .55;
-  cursor: not-allowed;
-}
+    .status {
+      font-size: 13px;
+      margin-top: 10px;
+      color: #666;
+    }
 
-.status {
-  font-size: 13px;
-  margin-top: 10px;
-  white-space: pre-wrap;
-}
+    .result {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #111;
+      color: #eee;
+      border-radius: 12px;
+      padding: 13px;
+      font-size: 12px;
+      max-height: 500px;
+      overflow: auto;
+    }
 
-.hidden {
-  display: none !important;
-}
+    .resolution {
+      border: 1px solid #eee;
+      border-radius: 12px;
+      padding: 12px;
+      margin-top: 10px;
+    }
 
-.result-title {
-  font-weight: 800;
-  margin-bottom: 10px;
-}
+    .resolution strong {
+      display: block;
+      margin-bottom: 4px;
+    }
 
-.video-item {
-  border: 1px solid #ddd;
-  border-radius: 12px;
-  padding: 12px;
-  margin-top: 9px;
-}
+    .download {
+      display: block;
+      text-align: center;
+      text-decoration: none;
+      background: #111;
+      color: white;
+      padding: 12px;
+      border-radius: 10px;
+      margin-top: 8px;
+      font-size: 13px;
+    }
 
-.video-info {
-  font-size: 13px;
-  line-height: 1.7;
-  word-break: break-word;
-}
-
-.video-info strong {
-  font-size: 15px;
-}
-
-.video-item button {
-  margin-top: 9px;
-  min-height: 42px;
-  font-size: 14px;
-}
-
-pre {
-  overflow-x: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  background: #111;
-  color: #eee;
-  border-radius: 12px;
-  padding: 12px;
-  font-size: 11px;
-  line-height: 1.5;
-  max-height: 420px;
-  overflow-y: auto;
-}
-
-.small {
-  color: #777;
-  font-size: 11px;
-  line-height: 1.5;
-}
-
-.error {
-  color: #b00020;
-}
-
-.success {
-  color: #087a3d;
-}
-</style>
+    .hidden {
+      display: none;
+    }
+  </style>
 </head>
 
 <body>
-<div class="app">
 
-  <div class="header">
+<div class="container">
+
+  <div class="card">
     <h1>BunnyDL BiliBili API</h1>
-    <p>Mobile-first REST API playground</p>
+
+    <p>
+      Masukkan URL BiliBili, CAPTCHA manual,
+      lalu Execute.
+    </p>
+
+    <div class="status" id="sessionStatus">
+      Membuat session...
+    </div>
   </div>
 
   <div class="card">
 
-    <div class="field">
-      <label for="videoUrl">BiliBili URL</label>
-      <input
-        id="videoUrl"
-        type="url"
-        placeholder="https://www.bilibili.com/..."
-        autocomplete="off"
-      />
-    </div>
+    <label>URL BiliBili</label>
 
-    <div class="field">
-      <label>CAPTCHA</label>
+    <input
+      id="videoUrl"
+      type="url"
+      placeholder="https://www.bilibili.com/video/..."
+    >
 
-      <div class="captcha-box">
-        <img id="captchaImage" alt="CAPTCHA" />
-        <div class="small">
-          Masukkan kode CAPTCHA secara manual.
-        </div>
-      </div>
+    <label>CAPTCHA</label>
+
+    <div class="captcha-box">
+
+      <img
+        id="captchaImage"
+        alt="CAPTCHA"
+      >
 
       <button
-        type="button"
-        class="secondary"
+        class="small-button"
         id="refreshCaptcha"
+        type="button"
       >
-        REFRESH CAPTCHA
+        Refresh
       </button>
+
     </div>
 
-    <div class="field">
-      <label for="captchaUuid">CAPTCHA UUID</label>
-      <input
-        id="captchaUuid"
-        type="text"
-        placeholder="UUID CAPTCHA"
-        autocomplete="off"
-      />
-    </div>
+    <input
+      id="captchaCode"
+      type="text"
+      maxlength="4"
+      autocomplete="off"
+      placeholder="Masukkan teks CAPTCHA"
+    >
 
-    <div class="field">
-      <label for="captchaCode">CAPTCHA Code</label>
-      <input
-        id="captchaCode"
-        type="text"
-        maxlength="8"
-        placeholder="Masukkan kode"
-        autocomplete="off"
-      />
-    </div>
+    <label>Format</label>
 
-    <div class="field">
-      <label for="format">Format</label>
-      <select id="format">
-        <option value="mp4">MP4</option>
-        <option value="mp3">MP3</option>
-        <option value="jpeg">JPEG</option>
-      </select>
-    </div>
+    <select id="format">
+      <option value="mp4">MP4</option>
+      <option value="mp3">MP3</option>
+      <option value="jpeg">JPEG</option>
+    </select>
 
     <button id="execute">
-      EXECUTE
+      Execute
     </button>
 
-    <div id="status" class="status"></div>
+    <div class="status" id="status"></div>
 
   </div>
 
-  <div id="resultsCard" class="card hidden">
+  <div
+    class="card hidden"
+    id="resolutionCard"
+  >
 
-    <div class="result-title">
-      AVAILABLE RESOLUTIONS
+    <h2>Resolution</h2>
+
+    <div id="resolutionList"></div>
+
+    <div id="autoDownload"></div>
+
+  </div>
+
+  <div class="card">
+
+    <h2>Response</h2>
+
+    <div
+      class="result"
+      id="response"
+    >
+      Belum ada response.
     </div>
 
-    <div id="results"></div>
-
-  </div>
-
-  <div id="rawCard" class="card hidden">
-
-    <div class="result-title">
-      RESPONSE
-    </div>
-
-    <pre id="rawResponse"></pre>
-
-  </div>
-
-  <div class="small">
-    CAPTCHA dan pembatas akses BunnyDL tetap berlaku.
-    Tombol download hanya menggunakan URL yang dikembalikan oleh
-    BunnyDL.
   </div>
 
 </div>
 
 <script>
-const captchaImage = document.getElementById("captchaImage");
-const captchaUuid = document.getElementById("captchaUuid");
-const captchaCode = document.getElementById("captchaCode");
-const refreshCaptcha = document.getElementById("refreshCaptcha");
-const execute = document.getElementById("execute");
-const statusBox = document.getElementById("status");
-const resultsCard = document.getElementById("resultsCard");
-const results = document.getElementById("results");
-const rawCard = document.getElementById("rawCard");
-const rawResponse = document.getElementById("rawResponse");
+  let sessionId = null;
 
-let currentCaptchaUrl = "";
+  const $ = (id) =>
+    document.getElementById(id);
 
-function setStatus(message, type = "") {
-  statusBox.className = "status " + type;
-  statusBox.textContent = message;
-}
+  async function createSession() {
 
-function refreshCaptchaImage() {
-  const rand = Math.floor(Math.random() * 1000000);
+    $("sessionStatus").textContent =
+      "Membuat session BunnyDL...";
 
-  currentCaptchaUrl =
-    "/api/captcha-image?rand=" +
-    rand;
+    try {
 
-  captchaImage.src = currentCaptchaUrl;
+      const response =
+        await fetch("/api/session");
 
-  /*
-   * UUID CAPTCHA tidak selalu bisa diperoleh hanya dari
-   * URL gambar. Karena itu UUID dapat diisi manual pada
-   * field di bawah sesuai flow/session yang digunakan.
-   */
-}
+      const data =
+        await response.json();
 
-refreshCaptcha.addEventListener("click", () => {
-  refreshCaptchaImage();
-  captchaCode.value = "";
-  setStatus("CAPTCHA diperbarui.");
-});
+      if (!response.ok || !data.success) {
+        throw new Error(
+          data.message ||
+          "Gagal membuat session"
+        );
+      }
 
-execute.addEventListener("click", async () => {
-  const url =
-    document.getElementById("videoUrl").value.trim();
+      sessionId =
+        data.session_id;
 
-  const uuid =
-    captchaUuid.value.trim();
+      $("sessionStatus").textContent =
+        "Session aktif.";
 
-  const code =
-    captchaCode.value.trim();
+      await refreshCaptcha();
 
-  const format =
-    document.getElementById("format").value;
+    } catch (error) {
 
-  if (!url) {
-    setStatus("Masukkan URL BiliBili.", "error");
-    return;
+      $("sessionStatus").textContent =
+        "Error: " + error.message;
+    }
   }
 
-  if (!uuid) {
-    setStatus("Masukkan CAPTCHA UUID.", "error");
-    return;
-  }
+  async function refreshCaptcha() {
 
-  if (!code) {
-    setStatus("Masukkan CAPTCHA Code.", "error");
-    return;
-  }
-
-  execute.disabled = true;
-  resultsCard.classList.add("hidden");
-  rawCard.classList.add("hidden");
-  results.innerHTML = "";
-
-  setStatus("Memproses request...");
-
-  try {
-    const response = await fetch("/api/resolve", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        url,
-        captcha_uuid: uuid,
-        captcha_code: code,
-        anonymous: true,
-        format
-      })
-    });
-
-    const data = await response.json();
-
-    rawCard.classList.remove("hidden");
-    rawResponse.textContent =
-      JSON.stringify(data, null, 2);
-
-    if (!data.success) {
-      setStatus(
-        data.message ||
-        data.error ||
-        "Request gagal.",
-        "error"
-      );
-
-      execute.disabled = false;
+    if (!sessionId) {
+      await createSession();
       return;
     }
 
-    if (!Array.isArray(data.videos) ||
-        data.videos.length === 0) {
+    const image =
+      $("captchaImage");
 
-      setStatus(
-        "Request berhasil, tetapi BunnyDL tidak mengembalikan video yang bisa ditampilkan.",
-        "error"
-      );
+    image.src =
+      "/api/captcha?session_id=" +
+      encodeURIComponent(sessionId) +
+      "&t=" +
+      Date.now();
 
-      execute.disabled = false;
+    $("captchaCode").value = "";
+
+    $("status").textContent =
+      "CAPTCHA baru dimuat.";
+  }
+
+  async function execute() {
+
+    if (!sessionId) {
+      $("status").textContent =
+        "Session belum siap.";
+
       return;
     }
 
-    renderVideos(data.videos);
+    const url =
+      $("videoUrl").value.trim();
 
-    setStatus(
-      data.videos.length +
-      " resolusi ditemukan.",
-      "success"
-    );
-
-  } catch (error) {
-    setStatus(
-      "Error: " + error.message,
-      "error"
-    );
-  }
-
-  execute.disabled = false;
-});
-
-function renderVideos(videos) {
-  results.innerHTML = "";
-
-  videos.forEach((video, index) => {
-    const item = document.createElement("div");
-    item.className = "video-item";
-
-    const title =
-      video.resolution ||
-      (
-        video.width &&
-        video.height
-          ? video.width + "x" + video.height
-          : "Unknown resolution"
-      );
+    const captcha =
+      $("captchaCode").value.trim();
 
     const format =
-      video.format || "unknown";
+      $("format").value;
 
-    const size =
-      video.size || "unknown";
+    if (!url) {
+      $("status").textContent =
+        "URL BiliBili wajib diisi.";
 
-    const donate =
-      video.donate_flag === null
-        ? "unknown"
-        : String(video.donate_flag);
-
-    item.innerHTML = \`
-      <div class="video-info">
-        <strong>\${escapeHtml(title)}</strong><br>
-        Format: \${escapeHtml(format)}<br>
-        Size: \${escapeHtml(String(size))}<br>
-        Donate flag: \${escapeHtml(donate)}
-      </div>
-    \`;
-
-    if (video.url) {
-      const button =
-        document.createElement("button");
-
-      button.textContent =
-        "DOWNLOAD " + title;
-
-      button.addEventListener("click", () => {
-        downloadVideo(
-          video.url,
-          title,
-          format
-        );
-      });
-
-      item.appendChild(button);
-    } else {
-      const note =
-        document.createElement("div");
-
-      note.className = "small";
-      note.style.marginTop = "8px";
-      note.textContent =
-        "URL download tidak diberikan pada response.";
-
-      item.appendChild(note);
+      return;
     }
 
-    results.appendChild(item);
-  });
+    if (!captcha) {
+      $("status").textContent =
+        "CAPTCHA wajib diisi.";
 
-  resultsCard.classList.remove("hidden");
-}
+      return;
+    }
 
-function downloadVideo(url, resolution, format) {
-  /*
-   * Hanya membuka URL yang diberikan BunnyDL.
-   * Tidak mengubah URL atau mencoba melewati
-   * pembatas akses/resolusi.
-   */
+    const button =
+      $("execute");
 
-  const extension =
-    format || "mp4";
+    button.disabled = true;
 
-  const filename =
-    "bilibili-" +
-    resolution.replace(/[^a-zA-Z0-9x_-]/g, "_") +
-    "." +
-    extension;
+    $("status").textContent =
+      "Memproses...";
 
-  const link =
-    document.createElement("a");
+    $("response").textContent =
+      "Loading...";
 
-  link.href = url;
-  link.download = filename;
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
+    $("resolutionCard")
+      .classList.add("hidden");
 
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-}
+    try {
 
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
+      const response =
+        await fetch("/api/resolve", {
 
-refreshCaptchaImage();
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json"
+          },
+
+          body: JSON.stringify({
+
+            session_id:
+              sessionId,
+
+            url,
+
+            captcha_code:
+              captcha,
+
+            format
+          })
+        });
+
+      const data =
+        await response.json();
+
+      $("response").textContent =
+        JSON.stringify(
+          data,
+          null,
+          2
+        );
+
+      if (
+        data.status === 409 ||
+        response.status === 409
+      ) {
+
+        $("status").textContent =
+          "CAPTCHA salah. Refresh CAPTCHA lalu coba lagi.";
+
+        await refreshCaptcha();
+
+        return;
+      }
+
+      if (
+        data.success &&
+        Array.isArray(data.resolution)
+      ) {
+
+        renderResolutions(
+          data.resolution
+        );
+
+        $("resolutionCard")
+          .classList.remove("hidden");
+      }
+
+      if (data.download_url) {
+
+        $("autoDownload").innerHTML =
+          '<a class="download" href="' +
+          escapeHTML(data.download_url) +
+          '" target="_blank" rel="noopener">' +
+          'Download Auto Stand' +
+          '</a>';
+      }
+
+      $("status").textContent =
+        data.message ||
+        "Selesai.";
+
+    } catch (error) {
+
+      $("status").textContent =
+        "Error: " +
+        error.message;
+
+      $("response").textContent =
+        error.stack ||
+        error.message;
+
+    } finally {
+
+      button.disabled = false;
+    }
+  }
+
+  function renderResolutions(list) {
+
+    const container =
+      $("resolutionList");
+
+    container.innerHTML = "";
+
+    if (!list.length) {
+
+      container.innerHTML =
+        "<p>Tidak ada resolution yang dikembalikan.</p>";
+
+      return;
+    }
+
+    list.forEach((item, index) => {
+
+      const wrapper =
+        document.createElement("div");
+
+      wrapper.className =
+        "resolution";
+
+      const width =
+        item.width || "";
+
+      const height =
+        item.height || "";
+
+      const resolution =
+        width && height
+          ? width + "x" + height
+          : (
+              item.resolution ||
+              item.media_desc ||
+              "Resolution " + (index + 1)
+            );
+
+      const format =
+        item.media_format ||
+        item.format ||
+        "";
+
+      const size =
+        item.file_size ||
+        item.filesize ||
+        item.size ||
+        "";
+
+      wrapper.innerHTML =
+        "<strong>" +
+        escapeHTML(String(resolution)) +
+        "</strong>" +
+
+        "<div>" +
+        escapeHTML(String(format)) +
+        (size
+          ? " · " + escapeHTML(String(size))
+          : "") +
+        "</div>";
+
+      const url =
+        item.url ||
+        item.download_url ||
+        item.video_url ||
+        item.play_url ||
+        item.auto_stand_url ||
+        item.src;
+
+      if (url) {
+
+        const link =
+          document.createElement("a");
+
+        link.className =
+          "download";
+
+        link.href = url;
+
+        link.target =
+          "_blank";
+
+        link.rel =
+          "noopener";
+
+        link.textContent =
+          "Download";
+
+        wrapper.appendChild(link);
+      }
+
+      container.appendChild(
+        wrapper
+      );
+    });
+  }
+
+  function escapeHTML(value) {
+
+    return value
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  $("refreshCaptcha")
+    .addEventListener(
+      "click",
+      refreshCaptcha
+    );
+
+  $("execute")
+    .addEventListener(
+      "click",
+      execute
+    );
+
+  createSession();
 </script>
 
 </body>
-</html>`);
-}
-
-async function handleCaptchaImage(request) {
-  const incoming = new URL(request.url);
-
-  const target =
-    new URL("/api/get_captcha", BUNNY_BASE);
-
-  for (const [key, value] of incoming.searchParams) {
-    target.searchParams.set(key, value);
-  }
-
-  try {
-    const response = await fetch(target.toString(), {
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*",
-        Referer: `${BUNNY_BASE}/id/bilibili`,
-      },
-    });
-
-    const headers = new Headers(response.headers);
-    headers.set("Cache-Control", "no-store");
-
-    return new Response(response.body, {
-      status: response.status,
-      headers,
-    });
-  } catch {
-    return json(
-      {
-        success: false,
-        error: "Gagal mengambil CAPTCHA BunnyDL.",
-      },
-      502
-    );
-  }
+</html>
+  `);
 }
 
 export default {
-  async fetch(request) {
-    const url = new URL(request.url);
+  async fetch(request, env) {
+
+    const url =
+      new URL(request.url);
 
     if (request.method === "OPTIONS") {
+
       return new Response(null, {
         status: 204,
-        headers: CORS,
+        headers: CORS_HEADERS,
       });
     }
 
     if (
-      url.pathname === "/api/resolve" &&
-      request.method === "POST"
+      request.method === "GET" &&
+      url.pathname === "/"
     ) {
-      return resolve(request);
-    }
 
-    if (
-      url.pathname === "/api/captcha-image" &&
-      request.method === "GET"
-    ) {
-      return handleCaptchaImage(request);
-    }
-
-    if (
-      url.pathname === "/" &&
-      request.method === "GET"
-    ) {
       return playground();
+    }
+
+    if (
+      request.method === "GET" &&
+      url.pathname === "/api/session"
+    ) {
+
+      return handleCreateSession(env);
+    }
+
+    if (
+      request.method === "GET" &&
+      url.pathname === "/api/captcha"
+    ) {
+
+      return handleCaptcha(
+        request,
+        env
+      );
+    }
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/api/resolve"
+    ) {
+
+      return handleResolve(
+        request,
+        env
+      );
     }
 
     return json(
       {
+        status: 404,
         success: false,
-        error: "Endpoint tidak ditemukan.",
+        message: "Endpoint tidak ditemukan",
         endpoints: {
           playground: "GET /",
+          session: "GET /api/session",
+          captcha: "GET /api/captcha?session_id=...",
           resolve: "POST /api/resolve",
-          captcha: "GET /api/captcha-image",
         },
       },
       404
